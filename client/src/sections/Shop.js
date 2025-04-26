@@ -156,17 +156,9 @@ const Button = styled.button`
   }
 `;
 
-const Select = styled.select`
-  padding: 0.5rem;
-  margin-top: 1rem;
-  border-radius: 5px;
-  width: 100%;
-`;
-
 const Shop = () => {
   const [file, setFile] = useState(null);
   const [includeImages, setIncludeImages] = useState(false);
-  const [theme, setTheme] = useState("blue");
   const [uploading, setUploading] = useState(false);
   const [downloadLink, setDownloadLink] = useState("");
   const [background, setBackground] = useState("");
@@ -187,7 +179,11 @@ const Shop = () => {
     const formData = new FormData();
     formData.append("file", file);
     formData.append("parse_images", includeImages);
-    formData.append("theme", JSON.stringify({ background: "#FF5733", text: "#000000" })); 
+    formData.append("theme", JSON.stringify({
+      background: "#FF5733", // 這可以保留或改成你選的顏色
+      text: "#000000",
+      backgroundImage: background  // 新增這行
+    }));
 
     try {
       const response = await fetch("http://localhost:8000/upload", {
