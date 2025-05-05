@@ -3,18 +3,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import os
 import json
+import re
+from io import BytesIO
 from docx import Document
+from docx.oxml.ns import qn
 from pptx import Presentation
-from pptx.dml.color import RGBColor
 from pptx.util import Inches, Pt
 from openai import OpenAI
 
-client = OpenAI(api_key="")
+# 初始化 OpenAI 客戶端
+client = OpenAI(api_key="")  # 或用 os.getenv("OPENAI_API_KEY")
 
-# Initialize FastAPI
+# 初始化 FastAPI
 app = FastAPI()
-
-# Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -23,221 +24,150 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Upload directory
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@app.post("/upload")
-async def upload_file(file: UploadFile, parse_images: bool = Form(False), theme: str = Form("")):
-    """
-    Accepts a Word document and converts it into a PowerPoint presentation.
-    """
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as f:
-        f.write(file.file.read())
-
-    theme_data = json.loads(theme)
-    pptx_file = generate_presentation(file_path, theme_data)
-    return {"pptx_url": f"http://localhost:8000/download/{os.path.basename(pptx_file)}"}
-
-
-def generate_presentation(docx_path, theme):
-    """
-    Reads the Word document, summarizes content, and creates slides.
-    """
-    doc = Document(docx_path)
-    full_text = "\n\n".join([para.text.strip() for para in doc.paragraphs if para.text.strip()])
-    slides_data = generate_multiple_slides(full_text)
-
-    prs = Presentation()
-    for slide_data in slides_data:
-        slide = prs.slides.add_slide(prs.slide_layouts[5])
-        title_shape = slide.shapes.title
-        title_shape.text = slide_data["title"]
-
-        for i, layout in enumerate(prs.slide_layouts):
-            print(f"Layout {i}: {layout.name}")
-
-        for paragraph in title_shape.text_frame.paragraphs:
-            for run in paragraph.runs:
-                run.font.size = Inches(0.56)  
-
-        content_placeholder = None
-        for shape in slide.placeholders:
-            if shape.placeholder_format.type == 2:  
-                content_placeholder = shape
-                break
-
-        if content_placeholder:
-            text_frame = content_placeholder.text_frame
-            text_frame.clear()
-            for point in slide_data["bullets"]:
-                p = text_frame.add_paragraph()
-                p.level = 0
-                run.text = f"• {point}"
-                run = p.add_run(point)
-                run.font.size = Pt(28)
-        else:
-            print("進來這裡了")
-            left = Inches(1)
-            top = Inches(2)
-            width = Inches(8)
-            height = Inches(4)
-            content_box = slide.shapes.add_textbox(left, top, width, height)
-            text_frame = content_box.text_frame
-            text_frame.clear()
-            text_frame.word_wrap = True
-            for point in slide_data["bullets"]:
-                p = text_frame.add_paragraph()
-                p.level = 0
-                run = p.add_run()        
-                run.text = f"• {point}"
-                run.font.size = Pt(28)
-
-    apply_theme(prs, theme)
-
-    pptx_filename = os.path.splitext(os.path.basename(docx_path))[0] + ".pptx"
-    pptx_path = os.path.join(UPLOAD_DIR, pptx_filename)
-    prs.save(pptx_path)
-
-    return pptx_path
-
-
-def chunk_and_summarize(full_text, chunk_size=1000):
-    """
-    Splits the full document into chunks and summarizes each using OpenAI.
-    """
-    paragraphs = full_text.split("\n\n")
-    chunks = []
-    current = ""
-
-    for para in paragraphs:
-        if len(current) + len(para) < chunk_size:
-            current += para + "\n\n"
-        else:
-            chunks.append(current.strip())
-            current = para + "\n\n"
-    if current:
-        chunks.append(current.strip())
-
-    summarized_bullets = []
-
-    for chunk in chunks:
-        prompt = (
-            "Please summarize the following section into 3 ~ 5 concise bullet points:\n"
-            f"\"\"\"{chunk}\"\"\""
-        )
-
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.5,
-            max_tokens=500
-        )
-        content = response.choices[0].message.content
-        bullets = [line.strip()[2:] for line in content.splitlines() if line.strip().startswith("- ")]
-        summarized_bullets.extend(bullets)
-
-    return summarized_bullets
-
-
-def generate_multiple_slides(full_text):
-    """
-    Generates slide structure based on summarized bullet points.
-    """
-    summarized_bullets = chunk_and_summarize(full_text)
-
+# GPT 摘要段落為 slide 結構
+def summarize_blocks_to_slides(paragraphs, client):
     prompt = (
-        "Based on the following summarized points, generate a PowerPoint slide structure:\n"
-        "Each slide should have a title and 3–5 bullet points.\n\n"
-        "Points:\n"
-        "- " + "\n- ".join(summarized_bullets) + "\n\n"
-        "Format:\n"
-        "Slide 1:\n"
-        "Title: ...\n"
-        "Bullets:\n"
-        "- ...\n"
-        "- ...\n\n"
-        "Slide 2:\n"
-        "Title: ...\n"
-        "Bullets:\n"
-        "- ...\n"
+        "You are given a document with paragraphs. Your task is to group them into slides.\n"
+        "Each slide should have a title and 3–5 bullet points derived from the paragraphs.\n"
+        "Input paragraphs:\n\n" +
+        "\n\n".join(paragraphs) +
+        "\n\nNow generate a PowerPoint structure in this format:\n\n"
+        "Slide 1:\nTitle: ...\nBullets:\n- ...\n- ...\n\nSlide 2:\nTitle: ...\nBullets:\n- ...\n"
     )
+
     response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        max_tokens=1500
+        temperature=0.5,
+        max_tokens=1800
     )
-    output = response.choices[0].message.content
-    return parse_multiple_slides(output)
+    return response.choices[0].message.content
 
-
-def parse_multiple_slides(output_text):
-    """
-    Parses GPT output into structured slide dictionaries.
-    """
+# GPT 回傳的 slide 結構解析
+def parse_slide_structure(text):
     slides = []
-    current_slide = {}
-    for line in output_text.splitlines():
+    current_slide = {"title": "", "bullets": []}
+    for line in text.splitlines():
         if line.lower().startswith("slide"):
-            if current_slide:
+            if current_slide["title"]:
                 slides.append(current_slide)
-            current_slide = {"title": "", "bullets": []}
+                current_slide = {"title": "", "bullets": []}
         elif line.lower().startswith("title:"):
             current_slide["title"] = line.split(":", 1)[1].strip()
         elif line.strip().startswith("- "):
             current_slide["bullets"].append(line.strip()[2:])
-    if current_slide:
+    if current_slide["title"]:
         slides.append(current_slide)
     return slides
 
+# 將每段原始段落對應到 GPT 產出的 slide
+def match_paragraphs_to_slides(paragraphs, slides):
+    slide_texts = [" ".join([s["title"]] + s["bullets"]).lower() for s in slides]
+    assignments = []
+    for para in paragraphs:
+        text = para.lower()
+        best_match = max(
+            range(len(slide_texts)),
+            key=lambda i: len(set(re.findall(r'\w+', text)) & set(re.findall(r'\w+', slide_texts[i])))
+        )
+        assignments.append(best_match)
+    return assignments
 
-def apply_theme(prs, theme):
-    """
-    Applies background color, text color, and background image if provided.
-    """
-    text_color = RGBColor(
-        int(theme["text"][1:3], 16),
-        int(theme["text"][3:5], 16),
-        int(theme["text"][5:7], 16),
-    )
+# 建立 PowerPoint
+def generate_fixed_presentation(docx_path, theme, client):
+    from pptx.dml.color import RGBColor
 
-    background_image = theme.get("backgroundImage", None)
-    background_path = None
-    print("background_image" + str(background_image))
-    if background_image:
-        background_path = os.path.join(os.path.dirname(__file__), "backgroundImages", background_image)
-    print("background_path: " + str(background_path))
-    for slide in prs.slides:
-        if background_path and os.path.exists(background_path):
-            pic = slide.shapes.add_picture(background_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
-            slide.shapes._spTree.remove(pic._element)
-            slide.shapes._spTree.insert(2, pic._element)
+    doc = Document(docx_path)
+    prs = Presentation()
 
-        else:
-            # Fallback to solid color background
-            background_color = RGBColor(
-                int(theme["background"][1:3], 16),
-                int(theme["background"][3:5], 16),
-                int(theme["background"][5:7], 16),
-            )
-            slide.background.fill.solid()
-            slide.background.fill.fore_color.rgb = background_color
+    blocks = []
+    rels = doc.part.rels
+    image_rids = {r.rId for r in rels.values() if "image" in r.target_ref}
 
-        # Set text color
-        for shape in slide.shapes:
-            if hasattr(shape, "text_frame") and shape.text_frame:
-                for para in shape.text_frame.paragraphs:
-                    para.font.color.rgb = text_color
+    for para in doc.paragraphs:
+        if para.text.strip():
+            blocks.append(('text', para.text.strip()))
+        for run in para.runs:
+            blips = run._element.xpath(".//a:blip")
+            for blip in blips:
+                embed = blip.get(qn('r:embed'))
+                if embed in image_rids:
+                    img_data = rels[embed].target_part.blob
+                    blocks.append(('image', img_data))
 
+    seen = set()
+    for shape in doc.inline_shapes:
+        blip = shape._inline.graphic.graphicData.pic.blipFill.blip
+        rId = blip.embed
+        if rId in rels and rId not in seen:
+            image_data = rels[rId].target_part.blob
+            blocks.append(('image', image_data))
+            seen.add(rId)
+
+    paragraphs = [b[1] for b in blocks if b[0] == 'text']
+    gpt_response = summarize_blocks_to_slides(paragraphs, client)
+    slides_data = parse_slide_structure(gpt_response)
+    assignments = match_paragraphs_to_slides(paragraphs, slides_data)
+
+    slides = []
+    for slide_data in slides_data:
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        title_shape = slide.shapes.title
+        title_shape.text = slide_data["title"]
+        content_box = slide.shapes.add_textbox(Inches(1), Inches(1.5), Inches(8), Inches(4.5))
+        tf = content_box.text_frame
+        for bullet in slide_data["bullets"]:
+            p = tf.add_paragraph()
+            p.text = f"• {bullet}"
+            p.level = 0
+            p.font.size = Pt(28)
+        slides.append(slide)
+
+    para_index = 0
+    for i, block in enumerate(blocks):
+        if block[0] == 'text':
+            para_index += 1
+        elif block[0] == 'image':
+            if para_index > 0:
+                slide_idx = assignments[para_index - 1]
+                slide = slides[slide_idx]
+                image_stream = BytesIO(block[1])
+                slide.shapes.add_picture(image_stream, Inches(1), Inches(5.3), height=Inches(2))
+
+    # 可選主題套用（略過背景處理）
+    if theme and "text" in theme:
+        text_color = RGBColor(
+            int(theme["text"][1:3], 16),
+            int(theme["text"][3:5], 16),
+            int(theme["text"][5:7], 16),
+        )
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text_frame") and shape.text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        para.font.color.rgb = text_color
+
+    pptx_path = os.path.splitext(docx_path)[0] + "_fixed.pptx"
+    prs.save(pptx_path)
+    return pptx_path
+
+# 上傳處理
+@app.post("/upload")
+async def upload_file(file: UploadFile, parse_images: bool = Form(False), theme: str = Form("")):
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+
+    theme_data = json.loads(theme) if theme else {}
+    pptx_file = generate_fixed_presentation(file_path, theme_data, client)
+    return {"pptx_url": f"http://localhost:8000/download/{os.path.basename(pptx_file)}"}
+
+# PPTX 下載
 @app.get("/download/{filename}")
 async def download_pptx(filename: str):
-    """
-    Serves the generated PPTX file.
-    """
     pptx_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(pptx_path):
         return FileResponse(pptx_path, filename=filename)
